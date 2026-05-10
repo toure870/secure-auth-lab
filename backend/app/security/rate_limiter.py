@@ -1,186 +1,149 @@
-"""Rate limiting avec Redis pour protection DDoS et brute force."""
-
-import redis
-from datetime import datetime, timedelta
-from typing import Tuple
-from app.config import settings
+"""Rate limiting using sliding window algorithm with Redis."""
 import logging
+from datetime import datetime, timedelta
+from typing import Optional
+
+import aioredis
+from fastapi import HTTPException, status
 
 logger = logging.getLogger(__name__)
 
 
 class RateLimiter:
-    """Rate limiting avec fenêtres glissantes (sliding window)."""
-
-    def __init__(self, redis_client: redis.Redis):
-        self.redis = redis_client
-        self.window_seconds = settings.RATE_LIMIT_WINDOW_SECONDS
-        self.max_requests = settings.RATE_LIMIT_REQUESTS
-
-    def is_allowed(
+    """
+    Rate limiting using sliding window algorithm.
+    
+    Benefits:
+    - Prevents DDoS attacks
+    - Prevents brute force attacks
+    - Fair rate limiting per user/IP
+    - Configurable per endpoint
+    - Redis-backed for distributed systems
+    """
+    
+    def __init__(self):
+        self.redis: Optional[aioredis.Redis] = None
+        self.key_prefix = "rate_limit:"
+    
+    async def connect(self, redis_url: str):
+        """Initialize Redis connection."""
+        try:
+            self.redis = await aioredis.from_url(
+                redis_url,
+                encoding="utf8",
+                decode_responses=True,
+            )
+        except Exception as e:
+            logger.error(f"Failed to connect to Redis: {str(e)}")
+            raise
+    
+    async def disconnect(self):
+        """Close Redis connection."""
+        if self.redis:
+            await self.redis.close()
+    
+    async def check_limit(
         self,
-        identifier: str,
-        max_requests: int = None,
-        window_seconds: int = None,
-    ) -> Tuple[bool, dict]:
-        """Vérifie si une requête est autorisée selon le rate limit.
+        key: str,
+        max_requests: int,
+        window_seconds: int,
+    ) -> bool:
+        """
+        Check if request is within rate limit.
+        
+        Uses sliding window algorithm:
+        - Track timestamps of requests
+        - Remove old requests outside window
+        - Check if within limit
         
         Args:
-            identifier: Clé unique (IP, user_id, etc.)
-            max_requests: Nombre max de requêtes (utilise la config sinon)
-            window_seconds: Fenêtre de temps en secondes
+            key: Unique identifier (user_id, IP, email, etc.)
+            max_requests: Maximum requests allowed
+            window_seconds: Time window in seconds
         
         Returns:
-            Tuple (is_allowed, info_dict)
+            True if within limit
+        
+        Raises:
+            HTTPException: If rate limit exceeded
         """
-        if max_requests is None:
-            max_requests = self.max_requests
-        if window_seconds is None:
-            window_seconds = self.window_seconds
-
-        key = f"rate_limit:{identifier}"
+        if not self.redis:
+            return True  # Skip if Redis unavailable
+        
+        redis_key = f"{self.key_prefix}{key}"
         now = datetime.utcnow().timestamp()
         window_start = now - window_seconds
-
-        try:
-            # Utiliser une pipeline Redis pour l'atomicité
-            pipe = self.redis.pipeline()
-            pipe.zremrangebyscore(key, 0, window_start)  # Supprimer les anciennes entrées
-            pipe.zcard(key)  # Compter les requêtes dans la fenêtre
-            pipe.zadd(key, {str(now): now})  # Ajouter la requête actuelle
-            pipe.expire(key, window_seconds + 1)  # Expiration auto
-            results = pipe.execute()
-
-            current_count = results[1]
-            is_allowed = current_count < max_requests
-            remaining = max(0, max_requests - current_count - 1)
-
-            info = {
-                "allowed": is_allowed,
-                "limit": max_requests,
-                "remaining": remaining,
-                "reset_at": datetime.fromtimestamp(
-                    now + window_seconds
-                ).isoformat(),
-            }
-
-            if not is_allowed:
-                logger.warning(
-                    f"Rate limit exceeded for {identifier}: {current_count}/{max_requests}"
-                )
-
-            return is_allowed, info
-
-        except redis.RedisError as e:
-            logger.error(f"Rate limiter Redis error: {str(e)}")
-            # En cas d'erreur Redis, on laisse passer (fail open)
-            return True, {"allowed": True, "limit": max_requests, "remaining": max_requests}
-
-    def get_status(self, identifier: str, window_seconds: int = None) -> dict:
-        """Obtient le statut actuel du rate limit."""
-        if window_seconds is None:
-            window_seconds = self.window_seconds
-
-        key = f"rate_limit:{identifier}"
+        
+        # Remove old requests outside the window
+        await self.redis.zremrangebyscore(
+            redis_key,
+            0,
+            window_start,
+        )
+        
+        # Count requests in window
+        request_count = await self.redis.zcard(redis_key)
+        
+        if request_count >= max_requests:
+            logger.warning(
+                f"Rate limit exceeded for {key}: "
+                f"{request_count}/{max_requests} requests"
+            )
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Rate limit exceeded",
+            )
+        
+        # Add current request
+        await self.redis.zadd(redis_key, {str(now): now})
+        
+        # Set key expiration (cleanup old keys)
+        await self.redis.expire(redis_key, window_seconds)
+        
+        return True
+    
+    async def get_remaining(
+        self,
+        key: str,
+        max_requests: int,
+        window_seconds: int,
+    ) -> int:
+        """
+        Get remaining requests for a key.
+        
+        Returns:
+            Number of remaining requests
+        """
+        if not self.redis:
+            return max_requests
+        
+        redis_key = f"{self.key_prefix}{key}"
         now = datetime.utcnow().timestamp()
         window_start = now - window_seconds
-
-        try:
-            count = self.redis.zcount(key, window_start, now)
-            return {
-                "identifier": identifier,
-                "requests_in_window": count,
-                "limit": self.max_requests,
-                "remaining": max(0, self.max_requests - count),
-            }
-        except redis.RedisError:
-            return {}
-
-    def reset(self, identifier: str) -> bool:
-        """Réinitialise le compteur pour un identifier."""
-        key = f"rate_limit:{identifier}"
-        try:
-            self.redis.delete(key)
-            logger.info(f"Rate limit reset for {identifier}")
-            return True
-        except redis.RedisError as e:
-            logger.error(f"Error resetting rate limit: {str(e)}")
-            return False
-
-
-class BruteForceProtector:
-    """Protection contre les attaques par force brute sur login."""
-
-    def __init__(self, redis_client: redis.Redis):
-        self.redis = redis_client
-        self.max_attempts = settings.BRUTE_FORCE_MAX_ATTEMPTS
-        self.lockout_minutes = settings.BRUTE_FORCE_LOCKOUT_MINUTES
-
-    def is_account_locked(self, user_identifier: str) -> Tuple[bool, int]:
-        """Vérifie si un compte est temporairement verrouillé.
         
-        Returns:
-            Tuple (is_locked, minutes_remaining)
-        """
-        key = f"brute_force:lock:{user_identifier}"
-        try:
-            ttl = self.redis.ttl(key)
-            if ttl > 0:
-                minutes_remaining = (ttl + 59) // 60  # Round up
-                return True, minutes_remaining
-            return False, 0
-        except redis.RedisError:
-            return False, 0
-
-    def record_failed_attempt(
-        self, user_identifier: str
-    ) -> Tuple[bool, int, int]:
-        """Enregistre une tentative échouée.
+        # Count requests in window
+        request_count = await self.redis.zcount(
+            redis_key,
+            window_start,
+            now,
+        )
         
-        Returns:
-            Tuple (should_lock, attempts, remaining_before_lock)
+        remaining = max(0, max_requests - request_count)
+        return remaining
+    
+    async def reset(
+        self,
+        key: str,
+    ) -> None:
         """
-        attempts_key = f"brute_force:attempts:{user_identifier}"
-        lock_key = f"brute_force:lock:{user_identifier}"
-
-        try:
-            pipe = self.redis.pipeline()
-            pipe.incr(attempts_key)
-            pipe.expire(attempts_key, self.lockout_minutes * 60)
-            results = pipe.execute()
-
-            attempts = results[0]
-            remaining = max(0, self.max_attempts - attempts)
-            should_lock = attempts >= self.max_attempts
-
-            if should_lock:
-                # Verrouiller le compte
-                self.redis.setex(
-                    lock_key,
-                    self.lockout_minutes * 60,
-                    "locked",
-                )
-                logger.warning(
-                    f"Account locked after {attempts} failed attempts: {user_identifier}"
-                )
-
-            return should_lock, attempts, remaining
-
-        except redis.RedisError as e:
-            logger.error(f"Brute force protector error: {str(e)}")
-            return False, 0, self.max_attempts
-
-    def reset_attempts(self, user_identifier: str) -> bool:
-        """Réinitialise les tentatives échouées après login réussi."""
-        attempts_key = f"brute_force:attempts:{user_identifier}"
-        lock_key = f"brute_force:lock:{user_identifier}"
-
-        try:
-            pipe = self.redis.pipeline()
-            pipe.delete(attempts_key)
-            pipe.delete(lock_key)
-            pipe.execute()
-            return True
-        except redis.RedisError as e:
-            logger.error(f"Error resetting attempts: {str(e)}")
-            return False
+        Reset rate limit for a key.
+        
+        Args:
+            key: Key to reset
+        """
+        if not self.redis:
+            return
+        
+        redis_key = f"{self.key_prefix}{key}"
+        await self.redis.delete(redis_key)
+        logger.debug(f"Reset rate limit for {key}")

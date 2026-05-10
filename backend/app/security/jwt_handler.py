@@ -1,228 +1,167 @@
-"""Gestion sécurisée des JWT tokens avec accès et refresh tokens."""
-
-from datetime import datetime, timedelta, timezone
-from typing import Optional, Dict, Any
-from jose import JWTError, jwt
-from app.config import settings
+"""JWT token creation and verification with security best practices."""
+from datetime import datetime, timedelta
+from typing import Dict, Any, Optional
 import logging
 
+from jose import JWTError, jwt
+from pydantic import ValidationError
+
+from app.config import get_settings
+
 logger = logging.getLogger(__name__)
-
-
-class TokenPayload:
-    """Payload structuré pour les tokens JWT."""
-
-    def __init__(
-        self,
-        sub: str,
-        user_id: str,
-        email: str,
-        username: str,
-        is_2fa_enabled: bool = False,
-        type: str = "access",
-        iat: Optional[datetime] = None,
-        exp: Optional[datetime] = None,
-        jti: Optional[str] = None,
-    ):
-        self.sub = sub  # Subject (user_id)
-        self.user_id = user_id
-        self.email = email
-        self.username = username
-        self.is_2fa_enabled = is_2fa_enabled
-        self.type = type  # "access" ou "refresh"
-        self.iat = iat or datetime.now(timezone.utc)
-        self.exp = exp
-        self.jti = jti  # JWT ID pour revocation tracking
-
-    def to_dict(self) -> Dict[str, Any]:
-        """Convertit le payload en dictionnaire."""
-        return {
-            "sub": self.sub,
-            "user_id": self.user_id,
-            "email": self.email,
-            "username": self.username,
-            "is_2fa_enabled": self.is_2fa_enabled,
-            "type": self.type,
-            "iat": self.iat.timestamp(),
-            "exp": self.exp.timestamp() if self.exp else None,
-            "jti": self.jti,
-        }
+settings = get_settings()
 
 
 class JWTHandler:
-    """Gestion sécurisée des JWT tokens."""
-
-    @staticmethod
-    def create_token(
-        user_id: str,
-        email: str,
-        username: str,
-        is_2fa_enabled: bool = False,
-        token_type: str = "access",
-        expires_delta: Optional[timedelta] = None,
-        jti: Optional[str] = None,
-    ) -> str:
-        """Crée un JWT token signé.
-        
-        Args:
-            user_id: ID de l'utilisateur
-            email: Email de l'utilisateur
-            username: Username de l'utilisateur
-            is_2fa_enabled: Si 2FA est activé
-            token_type: "access" ou "refresh"
-            expires_delta: Délai d'expiration personnalisé
-            jti: JWT ID pour le revocation tracking
-        
-        Returns:
-            Token JWT signé
+    """
+    JWT token handler with best practices:
+    - HS256 algorithm (symmetric)
+    - Short-lived access tokens (15 min)
+    - Longer refresh tokens (7 days)
+    - Token type in claims
+    - Issued-at and expiration validation
+    """
+    
+    def __init__(
+        self,
+        secret_key: str = settings.SECRET_KEY,
+        algorithm: str = settings.ALGORITHM,
+    ):
+        self.secret_key = secret_key
+        self.algorithm = algorithm
+    
+    def create_access_token(self, data: Dict[str, Any]) -> str:
         """
-        if expires_delta is None:
-            if token_type == "access":
-                expires_delta = timedelta(
-                    minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES
-                )
-            else:  # refresh
-                expires_delta = timedelta(
-                    days=settings.REFRESH_TOKEN_EXPIRE_DAYS
-                )
-
-        now = datetime.now(timezone.utc)
-        expire = now + expires_delta
-
-        payload = TokenPayload(
-            sub=user_id,
-            user_id=user_id,
-            email=email,
-            username=username,
-            is_2fa_enabled=is_2fa_enabled,
-            type=token_type,
-            iat=now,
-            exp=expire,
-            jti=jti,
-        )
-
-        token = jwt.encode(
-            payload.to_dict(),
-            settings.SECRET_KEY,
-            algorithm=settings.ALGORITHM,
-        )
-
-        logger.info(
-            f"Token created",
-            extra={
-                "user_id": user_id,
-                "token_type": token_type,
-                "expires_at": expire.isoformat(),
-            },
-        )
-
-        return token
-
-    @staticmethod
-    def create_access_token(
-        user_id: str,
-        email: str,
-        username: str,
-        is_2fa_enabled: bool = False,
-    ) -> str:
-        """Crée un access token avec expiration courte."""
-        return JWTHandler.create_token(
-            user_id=user_id,
-            email=email,
-            username=username,
-            is_2fa_enabled=is_2fa_enabled,
-            token_type="access",
-        )
-
-    @staticmethod
-    def create_refresh_token(user_id: str) -> str:
-        """Crée un refresh token avec expiration longue."""
-        return JWTHandler.create_token(
-            user_id=user_id,
-            email="",  # Refresh tokens n'ont pas besoin de l'email
-            username="",
-            token_type="refresh",
-        )
-
-    @staticmethod
-    def create_token_pair(
-        user_id: str,
-        email: str,
-        username: str,
-        is_2fa_enabled: bool = False,
-    ) -> Dict[str, str]:
-        """Crée une paire access + refresh token."""
-        access_token = JWTHandler.create_access_token(
-            user_id=user_id,
-            email=email,
-            username=username,
-            is_2fa_enabled=is_2fa_enabled,
-        )
-        refresh_token = JWTHandler.create_refresh_token(user_id=user_id)
-
-        return {
-            "access_token": access_token,
-            "refresh_token": refresh_token,
-            "token_type": "bearer",
-        }
-
-    @staticmethod
-    def verify_token(token: str, token_type: str = "access") -> Optional[TokenPayload]:
-        """Vérifie et décode un JWT token.
+        Create short-lived access token.
         
         Args:
-            token: Token JWT à vérifier
-            token_type: Type attendu du token ("access" ou "refresh")
+            data: Claims to include (user_id, email, etc.)
         
         Returns:
-            TokenPayload si valide, None sinon
+            Signed JWT token
+        """
+        to_encode = data.copy()
+        
+        # Add standard claims
+        now = datetime.utcnow()
+        expires = now + timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+        
+        to_encode.update({
+            "type": "access",  # Token type for validation
+            "iat": now,  # Issued at
+            "exp": expires,  # Expiration
+        })
+        
+        encoded_jwt = jwt.encode(
+            to_encode,
+            self.secret_key,
+            algorithm=self.algorithm,
+        )
+        
+        logger.debug(f"Access token created for user {data.get('sub')}")
+        return encoded_jwt
+    
+    def create_refresh_token(self, data: Dict[str, Any]) -> str:
+        """
+        Create long-lived refresh token.
+        
+        Args:
+            data: Claims to include (user_id, email, etc.)
+        
+        Returns:
+            Signed JWT token
+        """
+        to_encode = data.copy()
+        
+        # Add standard claims
+        now = datetime.utcnow()
+        expires = now + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)
+        
+        to_encode.update({
+            "type": "refresh",  # Token type for validation
+            "iat": now,
+            "exp": expires,
+        })
+        
+        encoded_jwt = jwt.encode(
+            to_encode,
+            self.secret_key,
+            algorithm=self.algorithm,
+        )
+        
+        logger.debug(f"Refresh token created for user {data.get('sub')}")
+        return encoded_jwt
+    
+    def verify_token(
+        self,
+        token: str,
+        token_type: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Verify JWT token signature and claims.
+        
+        Args:
+            token: JWT token to verify
+            token_type: Expected token type ("access", "refresh", or None)
+        
+        Returns:
+            Decoded token payload
+        
+        Raises:
+            JWTError: If token is invalid or expired
         """
         try:
             payload = jwt.decode(
                 token,
-                settings.SECRET_KEY,
-                algorithms=[settings.ALGORITHM],
+                self.secret_key,
+                algorithms=[self.algorithm],
             )
-
-            # Vérifier que le type de token correspond
-            if payload.get("type") != token_type:
+            
+            # Validate token type if specified
+            if token_type and payload.get("type") != token_type:
                 logger.warning(
-                    f"Token type mismatch: expected {token_type}, got {payload.get('type')}"
+                    f"Token type mismatch: expected {token_type}, "
+                    f"got {payload.get('type')}"
                 )
-                return None
-
-            return TokenPayload(
-                sub=payload.get("sub"),
-                user_id=payload.get("user_id"),
-                email=payload.get("email", ""),
-                username=payload.get("username", ""),
-                is_2fa_enabled=payload.get("is_2fa_enabled", False),
-                type=payload.get("type"),
-                iat=datetime.fromtimestamp(
-                    payload.get("iat"), tz=timezone.utc
-                ),
-                exp=datetime.fromtimestamp(
-                    payload.get("exp"), tz=timezone.utc
-                ) if payload.get("exp") else None,
-                jti=payload.get("jti"),
-            )
-
+                raise JWTError("Invalid token type")
+            
+            # Extract subject (user_id)
+            subject: str = payload.get("sub")
+            if subject is None:
+                raise JWTError("Token missing subject")
+            
+            return payload
+            
         except JWTError as e:
-            logger.warning(f"Token verification failed: {str(e)}")
-            return None
+            logger.warning(f"JWT verification failed: {str(e)}")
+            raise
         except Exception as e:
-            logger.error(f"Token verification error: {str(e)}")
-            return None
-
-    @staticmethod
-    def extract_user_id(token: str) -> Optional[str]:
-        """Extrait l'user_id d'un token sans validation complète."""
+            logger.error(f"Unexpected token verification error: {str(e)}")
+            raise JWTError(f"Token verification failed: {str(e)}")
+    
+    def decode_token(self, token: str) -> Optional[Dict[str, Any]]:
+        """
+        Safely decode token without raising exception.
+        
+        Returns None if token is invalid.
+        """
         try:
-            payload = jwt.decode(
-                token,
-                settings.SECRET_KEY,
-                algorithms=[settings.ALGORITHM],
-            )
-            return payload.get("user_id")
+            return self.verify_token(token)
         except JWTError:
             return None
+    
+    def is_token_expired(self, token: str) -> bool:
+        """
+        Check if token is expired without full verification.
+        """
+        try:
+            payload = jwt.decode(
+                token,
+                options={"verify_signature": False},
+            )
+            exp = payload.get("exp")
+            if exp:
+                return datetime.fromtimestamp(exp) < datetime.utcnow()
+            return False
+        except Exception:
+            return True
